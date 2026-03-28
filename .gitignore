@@ -1,0 +1,6 @@
+input_turni.xlsx
+output/
+app.py
+__pycache__/
+.claude/
+*.pyc
