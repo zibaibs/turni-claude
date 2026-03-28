@@ -10,6 +10,7 @@ from typing import Dict, List, Set, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
 
 INPUT_FILE = Path("input_turni.xlsx")
 OUTPUT_FILE = Path("output/turnazione_generata.xlsx")
@@ -669,11 +670,43 @@ def write_delta_section(
     start_row: int,
     days: List[datetime],
     demand_by_hour: Dict[int, List[int]],
-    deployed: Dict[int, List[int]],
-    z_deployed: Dict[int, List[int]],
-    delta: Dict[int, List[int]],
-    total_deficit: List[int],
+    num_operators: int,
 ) -> int:
+    last_op_row = 3 + num_operators
+
+    def dep(col: str, h: int) -> str:
+        """Count operators whose shift covers hour h using pure text comparison.
+        Shifts are zero-padded ("07", "16") so lexicographic order equals numeric order.
+        No VALUE() needed — avoids array-eval errors in all Excel versions."""
+        c = f"{col}$4:{col}${last_op_row}"
+        hs = f"{h:02d}"
+        return (
+            f"SUMPRODUCT("
+            f"(LEFT({c},2)<=\"{hs}\")"
+            f"*(MID({c},7,2)>\"{hs}\")"
+            f"*(IFERROR(IF(LEN({c})>11,MID({c},20,2),\"99\"),\"99\")<>\"{hs}\")"
+            f")"
+        )
+
+    def zdep(col: str, h: int) -> str:
+        """Same but restricted to Zetema group (column B)."""
+        c = f"{col}$4:{col}${last_op_row}"
+        b = f"$B$4:$B${last_op_row}"
+        hs = f"{h:02d}"
+        return (
+            f"SUMPRODUCT("
+            f"({b}=\"Zetema\")"
+            f"*(LEFT({c},2)<=\"{hs}\")"
+            f"*(MID({c},7,2)>\"{hs}\")"
+            f"*(IFERROR(IF(LEN({c})>11,MID({c},20,2),\"99\"),\"99\")<>\"{hs}\")"
+            f")"
+        )
+
+    red   = PatternFill("solid", fgColor="F8CBAD")
+    green = PatternFill("solid", fgColor="E2F0D9")
+    blue  = PatternFill("solid", fgColor="D9E2F3")
+    center = Alignment(horizontal="center")
+
     ws.cell(row=start_row, column=1, value="DELTA FABBISOGNO vs DEPLOYED - Copertura Oraria").font = Font(
         bold=True, size=12, color="1F4E79"
     )
@@ -684,26 +717,41 @@ def write_delta_section(
         cell = ws.cell(row=start_row + 2, column=c, value=value)
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="1F4E79")
-        cell.alignment = Alignment(horizontal="center")
+        cell.alignment = center
 
     row = start_row + 3
+    delta_first = row
     for h in range(7, 20):
         ws.cell(row=row, column=1, value=f"{h:02d}:00-{h+1:02d}:00")
         for d in range(7):
-            text = f"{deployed[h][d]} / {demand_by_hour[h][d]} ({delta[h][d]:+d})"
-            cell = ws.cell(row=row, column=2 + d, value=text)
-            cell.alignment = Alignment(horizontal="center")
-            if delta[h][d] < 0:
-                cell.fill = PatternFill("solid", fgColor="F8CBAD")
-            elif delta[h][d] == 0:
-                cell.fill = PatternFill("solid", fgColor="E2F0D9")
-            else:
-                cell.fill = PatternFill("solid", fgColor="D9E2F3")
+            col = chr(ord("D") + d)
+            fab = demand_by_hour[h][d]
+            d_formula = dep(col, h)
+            formula = f'={d_formula}&" / "&{fab}&" ("&TEXT({d_formula}-{fab},"+0;-0;0")&")"'
+            cell = ws.cell(row=row, column=2 + d, value=formula)
+            cell.alignment = center
         row += 1
+    delta_last = row - 1
 
+    # Colori condizionali basati sul segno nel testo "(+" / "(-" / "(0)"
+    delta_range = f"B{delta_first}:H{delta_last}"
+    ws.conditional_formatting.add(delta_range,
+        FormulaRule(formula=[f'ISNUMBER(FIND("(-",B{delta_first}))'], fill=red))
+    ws.conditional_formatting.add(delta_range,
+        FormulaRule(formula=[f'ISNUMBER(FIND("(+",B{delta_first}))'], fill=blue))
+    ws.conditional_formatting.add(delta_range,
+        FormulaRule(formula=[
+            f'NOT(ISNUMBER(FIND("(-",B{delta_first})))*NOT(ISNUMBER(FIND("(+",B{delta_first})))'
+        ], fill=green))
+
+    # Totale Deficit: somma MIN(0, deployed-fabbisogno) per ogni ora
     ws.cell(row=row, column=1, value="TOTALE DEFICIT").font = Font(bold=True)
     for d in range(7):
-        ws.cell(row=row, column=2 + d, value=total_deficit[d]).font = Font(bold=True)
+        col = chr(ord("D") + d)
+        parts = [f"MIN(0,{dep(col,h)}-{demand_by_hour[h][d]})" for h in range(7, 20)]
+        cell = ws.cell(row=row, column=2 + d, value="=" + "+".join(parts))
+        cell.font = Font(bold=True)
+        cell.alignment = center
 
     row += 3
     ws.cell(
@@ -714,20 +762,26 @@ def write_delta_section(
         cell = ws.cell(row=row, column=c, value=value)
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="1F4E79")
-        cell.alignment = Alignment(horizontal="center")
+        cell.alignment = center
     row += 1
 
+    zet_first = row
     for h in range(9, 19):
         ws.cell(row=row, column=1, value=f"{h:02d}:00-{h+1:02d}:00")
         for d in range(7):
-            value = z_deployed[h][d]
-            cell = ws.cell(row=row, column=2 + d, value=value)
-            cell.alignment = Alignment(horizontal="center")
-            if d < 6:
-                cell.fill = PatternFill("solid", fgColor="E2F0D9" if value >= 1 else "F8CBAD")
-            else:
-                cell.fill = PatternFill("solid", fgColor="D9E2F3")
+            col = chr(ord("D") + d)
+            cell = ws.cell(row=row, column=2 + d, value=f"={zdep(col, h)}")
+            cell.alignment = center
         row += 1
+    zet_last = row - 1
+
+    # CF Zetema: verde >=1, rosso <1 (Lun-Sab); domenica sempre blu
+    ws.conditional_formatting.add(f"B{zet_first}:G{zet_last}",
+        CellIsRule(operator="greaterThanOrEqual", formula=["1"], fill=green))
+    ws.conditional_formatting.add(f"B{zet_first}:G{zet_last}",
+        CellIsRule(operator="lessThan", formula=["1"], fill=red))
+    ws.conditional_formatting.add(f"H{zet_first}:H{zet_last}",
+        CellIsRule(operator="greaterThanOrEqual", formula=["0"], fill=blue))
 
     return row + 1
 
@@ -787,10 +841,7 @@ def _write_week_sheet(
         ws.column_dimensions[col].width = 20
     ws.column_dimensions["K"].width = 10
 
-    deployed, z_deployed, delta, total_deficit = compute_coverage_stats(
-        operators, schedule, demand_by_hour
-    )
-    write_delta_section(ws, 20, days, demand_by_hour, deployed, z_deployed, delta, total_deficit)
+    write_delta_section(ws, 20, days, demand_by_hour, len(operators))
 
 
 def write_report(
