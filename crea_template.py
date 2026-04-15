@@ -140,24 +140,26 @@ ws_c.cell(row=note_c_row + 1, column=1,
 ws_a = wb.create_sheet("Assenze")
 ws_a.row_dimensions[1].height = 30
 
-headers_a = ["Nome operatore", "Data assenza"]
-widths_a = [25, 20]
+headers_a = ["Nome operatore", "Data assenza", "Tipo assenza"]
+widths_a = [25, 20, 18]
 for c, (h, w) in enumerate(zip(headers_a, widths_a), start=1):
     header(ws_a, 1, c, h, w)
 
 # Example rows
 absences_ex = [
-    ("Mario Rossi", datetime(2025, 4, 9)),
-    ("Anna Bianchi", datetime(2025, 4, 14)),
+    ("Mario Rossi", datetime(2025, 4, 9), "Ferie"),
+    ("Anna Bianchi", datetime(2025, 4, 14), "Malattia"),
 ]
-for r, (name, date) in enumerate(absences_ex, start=2):
+for r, (name, date, tipo) in enumerate(absences_ex, start=2):
     example(ws_a, r, 1, name)
     cell_d = example(ws_a, r, 2, date)
     cell_d.number_format = "DD/MM/YYYY"
+    example(ws_a, r, 3, tipo)
 
 note_a = ws_a.cell(row=5, column=1,
                     value="⚠ Inserire una riga per ogni giorno di assenza."
-                          "  Il nome deve corrispondere esattamente al foglio Personale.")
+                          "  Il nome deve corrispondere esattamente al foglio Personale."
+                          "  Tipo: es. Ferie, Malattia, Permesso (opzionale, default: Assenza).")
 note_a.font = NOTE_FONT
 
 # ── Salva ─────────────────────────────────────────────────────────────────────

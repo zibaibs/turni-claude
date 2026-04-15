@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 import itertools
 import re
@@ -12,8 +12,9 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 
-INPUT_FILE = Path("input_turni.xlsx")
-OUTPUT_FILE = Path("output/turnazione_generata.xlsx")
+_HERE = Path(__file__).parent
+INPUT_FILE = _HERE / "input_turni.xlsx"
+OUTPUT_FILE = _HERE / "output" / "turnazione_generata.xlsx"
 DAY_LABELS = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
 SHIFT_RE = re.compile(r"^(\d{2}:\d{2})-(\d{2}:\d{2})(?:\n\(pausa (\d{2}:\d{2})\))?$")
 
@@ -61,6 +62,11 @@ def format_shift(start_h: int, end_h: int, pause_h: int | None) -> str:
     return f"{start_h:02d}:00-{end_h:02d}:00\n(pausa {pause_h:02d}:00)"
 
 
+def is_working_shift(s: str) -> bool:
+    """True if s is a valid shift string (not RIP, Ferie, Malattia, etc.)."""
+    return bool(SHIFT_RE.match(s))
+
+
 def parse_coverage_slot(slot_text: str) -> int | None:
     match = re.search(r"(\d{1,2})\D+(\d{1,2})", slot_text)
     if not match:
@@ -70,7 +76,7 @@ def parse_coverage_slot(slot_text: str) -> int | None:
 
 def load_input(
     path: Path,
-) -> Tuple[List[Operator], List[List[datetime]], List[Tuple[datetime, Dict[int, List[int]]]], Dict[str, Set[datetime]]]:
+) -> Tuple[List[Operator], List[List[datetime]], List[Tuple[datetime, Dict[int, List[int]]]], Dict[str, Dict[datetime, str]]]:
     """Load and validate the input workbook.
 
     Returns:
@@ -78,7 +84,7 @@ def load_input(
         weeks           – list of weeks; each week is a list of 7 datetime objects (Mon–Sun)
         demand_schedule – list of (start_date, demand_matrix) sorted ascending;
                           each matrix covers all weeks from start_date until the next entry
-        absences        – {operator_name: set of absence dates (midnight-normalised)}
+        absences        – {operator_name: {date: tipo_label}} e.g. {"Mario": {datetime(...): "Ferie"}}
     """
     if not path.exists():
         raise FileNotFoundError(f"File input non trovato: {path}")
@@ -162,18 +168,50 @@ def load_input(
     demand_schedule.sort(key=lambda x: x[0])
 
     # --- Assenze (stored as absolute dates for multi-week lookup) ---
-    absences: Dict[str, Set[datetime]] = {}
+    # Structure: {operator_name: {date: tipo_label}}
+    absences: Dict[str, Dict[datetime, str]] = {}
+    known_op_names = {op.name for op in operators}
     ws_assenze = wb["Assenze"]
-    for row in ws_assenze.iter_rows(min_row=2, values_only=True):
+    for row_idx, row in enumerate(ws_assenze.iter_rows(min_row=2, values_only=True), start=2):
         if not row[0] or not row[1]:
             continue
         name = str(row[0]).strip()
-        absence_date = row[1]
-        if not isinstance(absence_date, datetime):
+        raw_date = row[1]
+        tipo = str(row[2]).strip() if len(row) > 2 and row[2] else "Assenza"
+
+        # Normalizzazione tipo data: supporta datetime, date e stringhe comuni
+        if isinstance(raw_date, datetime):
+            absence_date = raw_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif isinstance(raw_date, date):
+            absence_date = datetime(raw_date.year, raw_date.month, raw_date.day)
+        elif isinstance(raw_date, str):
+            for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y"):
+                try:
+                    absence_date = datetime.strptime(raw_date.strip(), fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                print(
+                    f"[AVVISO] Assenze riga {row_idx}: data non riconosciuta per '{name}'"
+                    f": '{raw_date}' — assenza ignorata."
+                )
+                continue
+        else:
+            print(
+                f"[AVVISO] Assenze riga {row_idx}: tipo data non supportato per '{name}'"
+                f": {type(raw_date)} — assenza ignorata."
+            )
             continue
-        absences.setdefault(name, set()).add(
-            absence_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        )
+
+        if name not in known_op_names:
+            print(
+                f"[AVVISO] Assenze riga {row_idx}: operatore '{name}' non trovato nel foglio"
+                f" Personale — assenza ignorata."
+            )
+            continue
+
+        absences.setdefault(name, {})[absence_date] = tipo
 
     return operators, weeks, demand_schedule, absences
 
@@ -196,26 +234,29 @@ def get_demand_for_week(
 
 
 def get_week_absences(
-    absences: Dict[str, Set[datetime]],
+    absences: Dict[str, Dict[datetime, str]],
     week_days: List[datetime],
-) -> Dict[str, Set[int]]:
-    """Convert date-keyed absences to day-index (0–6) absences for a given week."""
+) -> Dict[str, Dict[int, str]]:
+    """Convert date-keyed absences to day-index (0–6) absences for a given week.
+
+    Returns {operator_name: {day_idx: tipo_label}}.
+    """
     week_map = {
         d.replace(hour=0, minute=0, second=0, microsecond=0): i
         for i, d in enumerate(week_days)
     }
-    result: Dict[str, Set[int]] = {}
-    for name, dates in absences.items():
-        for d in dates:
+    result: Dict[str, Dict[int, str]] = {}
+    for name, date_map in absences.items():
+        for d, tipo in date_map.items():
             idx = week_map.get(d)
             if idx is not None:
-                result.setdefault(name, set()).add(idx)
+                result.setdefault(name, {})[idx] = tipo
     return result
 
 
 def pick_sunday_workers(
     zetema_ops: List[Operator],
-    absences: Dict[str, Set[int]],
+    absences: Dict[str, Dict[int, str]],
     sunday_history: Dict[str, int],
 ) -> Set[str]:
     """Select which Zetema operators work on Sunday.
@@ -224,7 +265,7 @@ def pick_sunday_workers(
     members have collectively worked the fewest previous Sundays are preferred.
     Ties are broken randomly so different combinations share the load over time.
     """
-    available = [op for op in zetema_ops if 6 not in absences.get(op.name, set())]
+    available = [op for op in zetema_ops if 6 not in absences.get(op.name, {})]
     six_hour = [op for op in available if op.daily_hours == 6]
     four_hour = [op for op in available if op.daily_hours == 4]
 
@@ -251,7 +292,7 @@ def pick_sunday_workers(
 def generate_rest_days(
     operators: List[Operator],
     demand_by_hour: Dict[int, List[int]],
-    absences: Dict[str, Set[int]],
+    absences: Dict[str, Dict[int, str]],
     sunday_workers: Set[str],
     work_history: Dict[str, Dict[int, int]],
 ) -> Dict[str, Set[int]]:
@@ -275,9 +316,9 @@ def generate_rest_days(
     # --- Zetema rest days ---
     weekday_options: Dict[str, List[Tuple[int, ...]]] = {}
     for op in zetema_ops:
-        forced = set(d for d in absences.get(op.name, set()) if d < 6)
+        forced = set(d for d in absences.get(op.name, {}) if d < 6)
         if op.name in sunday_workers:
-            if 6 in absences.get(op.name, set()):
+            if 6 in absences.get(op.name, {}):
                 raise ValueError(f"'{op.name}' e' assegnato domenica ma risulta assente.")
             required_weekday_rip = 2
         else:
@@ -285,25 +326,41 @@ def generate_rest_days(
             rest_days[op.name] = {6}
 
         need_extra = required_weekday_rip - len(forced)
-        if need_extra < 0:
-            raise ValueError(f"Assenze e vincoli incompatibili per '{op.name}'.")
-        available = [d for d in range(6) if d not in forced]
-        weekday_options[op.name] = []
-        for combo in itertools.combinations(available, need_extra):
-            combined = tuple(sorted(set(combo) | forced))
-            if len(combined) == required_weekday_rip:
-                weekday_options[op.name].append(combined)
-        if not weekday_options[op.name]:
-            raise ValueError(f"Nessuna combinazione RIP valida per '{op.name}'.")
+        if need_extra <= 0:
+            # Assenze coprono (o superano) i riposi richiesti: nessun giorno extra da cercare
+            weekday_options[op.name] = [tuple(sorted(forced))]
+        else:
+            available = [d for d in range(6) if d not in forced]
+            weekday_options[op.name] = []
+            for combo in itertools.combinations(available, need_extra):
+                combined = tuple(sorted(set(combo) | forced))
+                if len(combined) >= required_weekday_rip:
+                    weekday_options[op.name].append(combined)
+            if not weekday_options[op.name]:
+                raise ValueError(f"Nessuna combinazione RIP valida per '{op.name}'.")
 
     zetema_names = [op.name for op in zetema_ops]
-    all_products = list(itertools.product(*(weekday_options[name] for name in zetema_names)))
-    random.shuffle(all_products)  # shuffle so ties are resolved randomly across runs
+
+    # Cap the search space to prevent exponential slowdown with many Zetema operators.
+    # Below the threshold do an exhaustive shuffled search; above it, random-sample.
+    _MAX_RIP_CANDIDATES = 20_000
+    _rip_product_size = 1
+    for _n in zetema_names:
+        _rip_product_size *= len(weekday_options[_n])
+
+    if _rip_product_size <= _MAX_RIP_CANDIDATES:
+        rip_candidates = list(itertools.product(*(weekday_options[name] for name in zetema_names)))
+        random.shuffle(rip_candidates)
+    else:
+        rip_candidates = [
+            tuple(random.choice(weekday_options[name]) for name in zetema_names)
+            for _ in range(_MAX_RIP_CANDIDATES)
+        ]
 
     best_score: float | None = None
-    all_best: List[Dict[str, Set[int]]] = []
+    best_candidate: Dict[str, Set[int]] | None = None
 
-    for candidate in all_products:
+    for candidate in rip_candidates:
         candidate_map = {name: set(days) for name, days in zip(zetema_names, candidate)}
 
         day_hours = [0] * 6
@@ -311,8 +368,9 @@ def generate_rest_days(
             for day_idx in range(6):
                 if day_idx not in candidate_map[op.name]:
                     day_hours[day_idx] += op.daily_hours
-        if any(hours < 10 for hours in day_hours):
-            continue
+
+        # Penalità per copertura insufficiente (non scarta: permette il meglio possibile con assenze forzate)
+        coverage_penalty = sum(max(0, 10 - h) for h in day_hours) * 100_000
 
         # Primary: minimise resting on high-demand days (scaled up)
         demand_score = sum(
@@ -327,30 +385,25 @@ def generate_rest_days(
             for d in candidate_map[name]
         ) * ROTATION_WEIGHT
 
-        score = demand_score * 1000 - rotation_bonus  # lower is better
+        score = demand_score * 1000 - rotation_bonus + coverage_penalty  # lower is better
 
         if best_score is None or score < best_score:
             best_score = score
-            all_best = [candidate_map]
-        elif score == best_score:
-            all_best.append(candidate_map)
+            best_candidate = candidate_map
 
-    if not all_best:
+    if best_candidate is None:
         raise ValueError("Impossibile assegnare RIP Zetema con copertura 09:00-19:00 lun-sab.")
 
-    chosen = random.choice(all_best)
     for op in zetema_ops:
-        rest_days.setdefault(op.name, set()).update(chosen[op.name])
+        rest_days.setdefault(op.name, set()).update(best_candidate[op.name])
 
     # --- Non-Zetema rest days ---
     nonz_rest_count = [0] * 6
     for op in non_zetema_ops:
-        forced = set(absences.get(op.name, set()))
+        forced = set(absences.get(op.name, {}))  # keys are day indices
         forced.add(6)  # Sunday is always rest
 
-        if len(forced) > 2:
-            raise ValueError(f"Assenze e vincoli rendono impossibile 5 LAV + 2 RIP per '{op.name}'.")
-
+        # Se assenze > 2, l'operatore lavora meno di 5 giorni (gestito senza crash)
         history = work_history.get(op.name, {})
         while len(forced) < 2:
             cands = [d for d in range(6) if d not in forced]
@@ -376,8 +429,9 @@ def generate_rest_days(
             op.daily_hours for op in operators if day_idx not in rest_days[op.name]
         )
         if available_hours < 13:
-            raise ValueError(
-                f"Riposi non fattibili: ore disponibili insufficienti in {DAY_LABELS[day_idx]}."
+            print(
+                f"[AVVISO] Ore disponibili insufficienti in {DAY_LABELS[day_idx]} "
+                f"({available_hours}h) — assenze non assorbibili, copertura ridotta."
             )
     return rest_days
 
@@ -412,11 +466,13 @@ def build_schedule(
 ) -> Dict[str, List[str]]:
     """Assign concrete shifts to every working day for every operator.
 
-    prev_preferred – preferred shifts from the previous week; used as a gentle
-    tie-breaker so runs vary across weeks without forcing artificial changes.
+    prev_preferred – dominant shifts from the previous week; used as a strong
+    anchor to keep each operator on the same recurring shift across weeks.
     """
     schedule: Dict[str, List[str]] = {op.name: ["RIP"] * 7 for op in operators}
-    preferred_shift: Dict[str, str] = {}
+    # Pre-populate from last week so the first day of each week already has a
+    # preferred shift and doesn't drift purely on demand.
+    preferred_shift: Dict[str, str] = dict(prev_preferred) if prev_preferred else {}
 
     for day_idx in range(7):
         coverage = {h: 0 for h in range(7, 20)}
@@ -433,10 +489,22 @@ def build_schedule(
             best_combo: Tuple[str, ...] | None = None
             best_combo_score = -10**9
 
-            all_combos = list(itertools.product(*option_buckets))
-            random.shuffle(all_combos)  # random ordering so ties resolve differently each run
+            # Cap the search space to prevent exponential slowdown with many Zetema operators.
+            _MAX_SHIFT_COMBOS = 5_000
+            _shift_combo_size = 1
+            for _opts in option_buckets:
+                _shift_combo_size *= len(_opts)
 
-            for combo in all_combos:
+            if _shift_combo_size <= _MAX_SHIFT_COMBOS:
+                shift_candidates: List[Tuple[str, ...]] = list(itertools.product(*option_buckets))
+                random.shuffle(shift_candidates)
+            else:
+                shift_candidates = [
+                    tuple(random.choice(opts) for opts in option_buckets)
+                    for _ in range(_MAX_SHIFT_COMBOS)
+                ]
+
+            for combo in shift_candidates:
                 test_cov = {h: 0 for h in range(9, 19)}
                 combo_score = 0
                 for op, shift in zip(zetema_workers, combo):
@@ -446,11 +514,12 @@ def build_schedule(
                             test_cov[h] += 1
                         unmet = max(0, demand_by_hour.get(h, [0] * 7)[day_idx] - coverage[h])
                         combo_score += unmet * 8 + 1
+                    # Strong consistency bonus: same shift as the running preferred
                     if preferred_shift.get(op.name) == shift:
-                        combo_score += 4
-                    # Small bonus for variety vs. previous week
-                    if prev_preferred and prev_preferred.get(op.name) != shift:
-                        combo_score += 1
+                        combo_score += 300
+                    # Cross-week consistency: same shift as last week's dominant
+                    if prev_preferred and prev_preferred.get(op.name) == shift:
+                        combo_score += 200
                 missing_slots = sum(1 for h in range(9, 19) if test_cov[h] == 0)
                 combo_score -= missing_slots * 1000
                 if combo_score > best_combo_score:
@@ -491,11 +560,12 @@ def build_schedule(
                         score += 180
                     if day_idx < 6 and op.group == "Zetema" and 9 <= h < 19 and z_coverage[h] == 0:
                         score += 260
+                # Strong consistency bonus: same shift as the running preferred
                 if preferred_shift.get(op.name) == option:
-                    score += 4
-                # Small bonus for variety vs. previous week
-                if prev_preferred and prev_preferred.get(op.name) != option:
-                    score += 1
+                    score += 300
+                # Cross-week consistency: same shift as last week's dominant
+                if prev_preferred and prev_preferred.get(op.name) == option:
+                    score += 200
                 if score > best_score:
                     best_score = score
                     best_shift = option
@@ -517,7 +587,7 @@ def build_schedule(
                 zcov = {h: 0 for h in range(9, 19)}
                 for d_op in all_day_workers:
                     s = schedule[d_op.name][day_idx]
-                    if s == "RIP":
+                    if not is_working_shift(s):
                         continue
                     for h in shift_to_hours(s):
                         cov[h] += 1
@@ -554,7 +624,11 @@ def build_schedule(
     return schedule
 
 
-def validate_schedule(operators: List[Operator], schedule: Dict[str, List[str]]) -> None:
+def validate_schedule(
+    operators: List[Operator],
+    schedule: Dict[str, List[str]],
+    rest_days: Dict[str, Set[int]] | None = None,
+) -> None:
     by_name = {op.name: op for op in operators}
 
     for op in operators:
@@ -562,15 +636,20 @@ def validate_schedule(operators: List[Operator], schedule: Dict[str, List[str]])
         if not shifts or len(shifts) != 7:
             raise ValueError(f"Planning mancante o incompleto per '{op.name}'.")
 
-        lav = sum(1 for s in shifts if s != "RIP")
-        if lav != 5:
-            raise ValueError(f"'{op.name}' non rispetta 5 LAV + 2 RIP.")
-        if op.group == "Non Zetema" and shifts[6] != "RIP":
+        lav = sum(1 for s in shifts if is_working_shift(s))
+        expected_lav = (7 - len(rest_days[op.name])) if rest_days else 5
+        if lav != expected_lav:
+            raise ValueError(
+                f"'{op.name}': attesi {expected_lav} giorni lavorativi, trovati {lav}."
+            )
+        if op.group == "Non Zetema" and is_working_shift(shifts[6]):
             raise ValueError(f"'{op.name}' Non Zetema non puo' lavorare di domenica.")
-        if op.group == "Zetema" and shifts[6] != "RIP":
-            rip_lun_sab = sum(1 for s in shifts[:6] if s == "RIP")
-            if rip_lun_sab != 2:
-                raise ValueError(f"'{op.name}' Zetema domenicale deve avere 2 RIP lun-sab.")
+        if op.group == "Zetema" and is_working_shift(shifts[6]):
+            rip_lun_sab = sum(1 for s in shifts[:6] if not is_working_shift(s))
+            # Per Zetema domenicale, rest_days contiene solo giorni lun-sab
+            expected_rip_lun_sab = len(rest_days[op.name]) if rest_days else 2
+            if rip_lun_sab != expected_rip_lun_sab:
+                raise ValueError(f"'{op.name}' Zetema domenicale deve avere {expected_rip_lun_sab} RIP lun-sab.")
 
         for day_idx, shift in enumerate(shifts):
             if shift == "RIP":
@@ -601,7 +680,7 @@ def validate_schedule(operators: List[Operator], schedule: Dict[str, List[str]])
 
         for name, shifts in schedule.items():
             shift = shifts[day_idx]
-            if shift == "RIP":
+            if not is_working_shift(shift):
                 continue
             op = by_name[name]
             if day_idx == 6:
@@ -651,7 +730,7 @@ def compute_coverage_stats(
     for day_idx in range(7):
         for name, shifts in schedule.items():
             shift = shifts[day_idx]
-            if shift == "RIP":
+            if not is_working_shift(shift):
                 continue
             op = by_name[name]
             for h in shift_to_hours(shift):
@@ -710,7 +789,7 @@ def write_delta_section(
     ws.cell(row=start_row, column=1, value="DELTA FABBISOGNO vs DEPLOYED - Copertura Oraria").font = Font(
         bold=True, size=12, color="1F4E79"
     )
-    ws.cell(row=start_row + 1, column=1, value="Formato: Deployed / Fabbisogno (Delta)")
+    ws.cell(row=start_row + 1, column=1, value="Risultato: Delta (Deployed − Fabbisogno)")
 
     headers = ["Fascia Oraria"] + [f"{DAY_LABELS[i]} {d.day}/{d.month}" for i, d in enumerate(days)]
     for c, value in enumerate(headers, start=1):
@@ -727,22 +806,20 @@ def write_delta_section(
             col = chr(ord("D") + d)
             fab = demand_by_hour[h][d]
             d_formula = dep(col, h)
-            formula = f'={d_formula}&" / "&{fab}&" ("&TEXT({d_formula}-{fab},"+0;-0;0")&")"'
+            formula = f'=TEXT({d_formula}-{fab},"+0;-0;0")'
             cell = ws.cell(row=row, column=2 + d, value=formula)
             cell.alignment = center
         row += 1
     delta_last = row - 1
 
-    # Colori condizionali basati sul segno nel testo "(+" / "(-" / "(0)"
+    # Colori condizionali: rosso se negativo, blu se positivo, verde se zero
     delta_range = f"B{delta_first}:H{delta_last}"
     ws.conditional_formatting.add(delta_range,
-        FormulaRule(formula=[f'ISNUMBER(FIND("(-",B{delta_first}))'], fill=red))
+        FormulaRule(formula=[f'LEFT(B{delta_first},1)="-"'], fill=red))
     ws.conditional_formatting.add(delta_range,
-        FormulaRule(formula=[f'ISNUMBER(FIND("(+",B{delta_first}))'], fill=blue))
+        FormulaRule(formula=[f'LEFT(B{delta_first},1)="+"'], fill=blue))
     ws.conditional_formatting.add(delta_range,
-        FormulaRule(formula=[
-            f'NOT(ISNUMBER(FIND("(-",B{delta_first})))*NOT(ISNUMBER(FIND("(+",B{delta_first})))'
-        ], fill=green))
+        FormulaRule(formula=[f'B{delta_first}="0"'], fill=green))
 
     # Totale Deficit: somma MIN(0, deployed-fabbisogno) per ogni ora
     ws.cell(row=row, column=1, value="TOTALE DEFICIT").font = Font(bold=True)
@@ -815,7 +892,9 @@ def _write_week_sheet(
 
     for r, op in enumerate(operators, start=4):
         shifts = schedule[op.name]
-        weekly_hours = sum(op.daily_hours for s in shifts if s != "RIP")
+        work_shifts = [s for s in shifts if is_working_shift(s)]
+        dominant = max(set(work_shifts), key=work_shifts.count) if work_shifts else None
+        weekly_hours = sum(op.daily_hours for s in shifts if is_working_shift(s))
         row_values = [op.name, op.group, op.daily_hours] + shifts + [weekly_hours]
         for c, value in enumerate(row_values, start=1):
             cell = ws.cell(row=r, column=c, value=value)
@@ -824,6 +903,14 @@ def _write_week_sheet(
                 if value == "RIP":
                     cell.fill = PatternFill("solid", fgColor="F2DCDB")
                     cell.font = Font(color="C00000", bold=True)
+                elif not is_working_shift(value):
+                    # Assenza con tipo (Ferie, Malattia, ecc.)
+                    cell.fill = PatternFill("solid", fgColor="FFE0B2")
+                    cell.font = Font(color="BF5000", bold=True)
+                elif dominant is not None and value != dominant:
+                    # Turno diverso da quello dominante della settimana
+                    cell.fill = PatternFill("solid", fgColor="FFE699")
+                    cell.font = Font(color="7F6000", bold=True)
                 else:
                     cell.fill = PatternFill("solid", fgColor="D9E2F3")
                     cell.font = Font(color="1F4E79")
@@ -848,7 +935,7 @@ def write_report(
     operators: List[Operator],
     week_results: List[Tuple[List[datetime], Dict[str, List[str]], Dict[int, List[int]]]],
 ) -> Path:
-    report_path = Path("output/report_turnazione.txt")
+    report_path = _HERE / "output" / "report_turnazione.txt"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     lines: List[str] = []
 
@@ -893,7 +980,7 @@ def write_report(
         lines.append("")
         lines.append("Omogeneita' turni settimanale (soft):")
         for op in operators:
-            work_shifts = [s for s in schedule[op.name] if s != "RIP"]
+            work_shifts = [s for s in schedule[op.name] if is_working_shift(s)]
             distinct = len(set(work_shifts))
             lines.append(f"- {op.name}: {distinct} turno/i distinti")
 
@@ -956,20 +1043,27 @@ def main() -> None:
         schedule = build_schedule(
             operators, demand_by_hour, rest_days, sunday_workers, prev_preferred
         )
-        validate_schedule(operators, schedule)
+
+        # Replace "RIP" on absence days with the actual tipo label (Ferie, Malattia, ecc.)
+        for op in operators:
+            for day_idx, tipo in week_absences.get(op.name, {}).items():
+                if schedule[op.name][day_idx] == "RIP":
+                    schedule[op.name][day_idx] = tipo
+
+        validate_schedule(operators, schedule, rest_days)
 
         # Update rotation trackers for next week
         for op in operators:
-            if schedule[op.name][6] != "RIP":
+            if is_working_shift(schedule[op.name][6]):
                 sunday_history[op.name] += 1
             for day_idx, shift in enumerate(schedule[op.name]):
-                if shift != "RIP":
+                if is_working_shift(shift):
                     work_history[op.name][day_idx] = work_history[op.name].get(day_idx, 0) + 1
 
         # Remember this week's preferred shifts for variety scoring next week
         prev_preferred = {}
         for op in operators:
-            work_shifts = [s for s in schedule[op.name] if s != "RIP"]
+            work_shifts = [s for s in schedule[op.name] if is_working_shift(s)]
             if work_shifts:
                 # Most common shift this week = "preferred" to vary next week
                 prev_preferred[op.name] = max(set(work_shifts), key=work_shifts.count)
