@@ -4,3 +4,7 @@ app.py
 __pycache__/
 .claude/
 *.pyc
+build/
+.DS_Store
+~$*
+.venv/

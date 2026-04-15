@@ -22,6 +22,10 @@ SHIFT_RE = re.compile(r"^(\d{2}:\d{2})-(\d{2}:\d{2})(?:\n\(pausa (\d{2}:\d{2})\)
 # Higher value = stronger rotation pressure vs. demand balance.
 ROTATION_WEIGHT = 50
 
+# Retry loop: rigenera schedule se i delta negativi sono eccessivi.
+MAX_SCHEDULE_RETRIES = 10      # tentativi massimi per settimana
+DEFICIT_TOLERANCE = -2         # deficit giornaliero accettabile (persona-ore)
+
 
 @dataclass
 class Operator:
@@ -652,7 +656,7 @@ def validate_schedule(
                 raise ValueError(f"'{op.name}' Zetema domenicale deve avere {expected_rip_lun_sab} RIP lun-sab.")
 
         for day_idx, shift in enumerate(shifts):
-            if shift == "RIP":
+            if not is_working_shift(shift):
                 continue
             start, end, pause = parse_shift(shift)
             if not (7 * 60 <= start < end <= 20 * 60):
@@ -1036,13 +1040,45 @@ def main() -> None:
         demand_by_hour = get_demand_for_week(demand_schedule, week_days[0])
         week_absences = get_week_absences(absences, week_days)
 
-        sunday_workers = pick_sunday_workers(zetema_ops, week_absences, sunday_history)
-        rest_days = generate_rest_days(
-            operators, demand_by_hour, week_absences, sunday_workers, work_history
-        )
-        schedule = build_schedule(
-            operators, demand_by_hour, rest_days, sunday_workers, prev_preferred
-        )
+        best_schedule = None
+        best_rest_days = None
+        best_sunday_workers = None
+        best_deficit_score: float = float("inf")
+        attempts_done = 0
+
+        for attempt in range(MAX_SCHEDULE_RETRIES):
+            attempts_done = attempt + 1
+            sunday_workers = pick_sunday_workers(zetema_ops, week_absences, sunday_history)
+            rest_days = generate_rest_days(
+                operators, demand_by_hour, week_absences, sunday_workers, work_history
+            )
+            schedule = build_schedule(
+                operators, demand_by_hour, rest_days, sunday_workers, prev_preferred
+            )
+
+            _, _, _, total_deficit = compute_coverage_stats(
+                operators, schedule, demand_by_hour
+            )
+            deficit_score = sum(-d for d in total_deficit if d < 0)
+
+            if deficit_score < best_deficit_score:
+                best_deficit_score = deficit_score
+                best_schedule = {name: list(shifts) for name, shifts in schedule.items()}
+                best_rest_days = {name: set(days) for name, days in rest_days.items()}
+                best_sunday_workers = set(sunday_workers)
+
+            if all(d >= DEFICIT_TOLERANCE for d in total_deficit):
+                break
+
+        schedule = best_schedule
+        rest_days = best_rest_days
+        sunday_workers = best_sunday_workers
+
+        if best_deficit_score > 0 and attempts_done > 1:
+            print(
+                f"  [AVVISO] Sett. {week_num}: miglior risultato dopo {attempts_done} tentativi"
+                f" — deficit residuo {best_deficit_score} persona-ore."
+            )
 
         # Replace "RIP" on absence days with the actual tipo label (Ferie, Malattia, ecc.)
         for op in operators:
