@@ -13,9 +13,10 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 
-# PyInstaller: sys.executable punta all'exe; __file__ punta alla cartella temp
+# PyInstaller: usa CWD (cartella da cui viene lanciato l'exe/bat)
+# così input_turni.xlsx e output/ si trovano sempre accanto al bat/exe.
 if getattr(sys, "frozen", False):
-    _HERE = Path(sys.executable).parent
+    _HERE = Path.cwd()
 else:
     _HERE = Path(__file__).parent
 INPUT_FILE = _HERE / "input_turni.xlsx"
