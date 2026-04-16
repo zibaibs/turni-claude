@@ -13,10 +13,11 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 
-# PyInstaller: usa CWD (cartella da cui viene lanciato l'exe/bat)
-# così input_turni.xlsx e output/ si trovano sempre accanto al bat/exe.
+# PyInstaller: sys.executable punta all'exe stesso (affidabile in ogni
+# modalità di lancio: terminale, Finder, bat). L'exe deve stare nella
+# stessa cartella di input_turni.xlsx (radice progetto, non dist/).
 if getattr(sys, "frozen", False):
-    _HERE = Path.cwd()
+    _HERE = Path(sys.executable).parent
 else:
     _HERE = Path(__file__).parent
 INPUT_FILE = _HERE / "input_turni.xlsx"

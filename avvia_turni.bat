@@ -10,8 +10,8 @@ if not exist "input_turni.xlsx" (
 
 if not exist "output" mkdir output
 
-if exist "dist\GeneraTurni.exe" (
-    dist\GeneraTurni.exe
+if exist "GeneraTurni.exe" (
+    GeneraTurni.exe
 ) else (
     python turnazione_completa.py
 )
