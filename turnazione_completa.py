@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -12,7 +13,11 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 
-_HERE = Path(__file__).parent
+# PyInstaller: sys.executable punta all'exe; __file__ punta alla cartella temp
+if getattr(sys, "frozen", False):
+    _HERE = Path(sys.executable).parent
+else:
+    _HERE = Path(__file__).parent
 INPUT_FILE = _HERE / "input_turni.xlsx"
 OUTPUT_FILE = _HERE / "output" / "turnazione_generata.xlsx"
 DAY_LABELS = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
