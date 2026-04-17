@@ -162,6 +162,37 @@ note_a = ws_a.cell(row=5, column=1,
                           "  Tipo: es. Ferie, Malattia, Permesso (opzionale, default: Assenza).")
 note_a.font = NOTE_FONT
 
+# ── 5. VincoliTemporali (opzionale) ──────────────────────────────────────────
+ws_v = wb.create_sheet("VincoliTemporali")
+ws_v.row_dimensions[1].height = 30
+
+headers_v = ["Nome operatore", "Data inizio", "Data fine", "Ora inizio", "Ora fine", "Note"]
+widths_v = [25, 18, 18, 14, 14, 30]
+for c, (h, w) in enumerate(zip(headers_v, widths_v), start=1):
+    header(ws_v, 1, c, h, w)
+
+vincoli_ex = [
+    ("Mario Rossi", datetime(2025, 5, 1), datetime(2025, 5, 31), "07:00", "14:00", "Solo mattina"),
+    ("Anna Bianchi", datetime(2025, 6, 10), datetime(2025, 6, 10), "13:00", "20:00", "Visita medica mattina"),
+]
+for r, (name, d_start, d_end, t_start, t_end, nota) in enumerate(vincoli_ex, start=2):
+    example(ws_v, r, 1, name)
+    c_ds = example(ws_v, r, 2, d_start); c_ds.number_format = "DD/MM/YYYY"
+    c_de = example(ws_v, r, 3, d_end);   c_de.number_format = "DD/MM/YYYY"
+    example(ws_v, r, 4, t_start)
+    example(ws_v, r, 5, t_end)
+    example(ws_v, r, 6, nota)
+
+note_v_row = len(vincoli_ex) + 3
+ws_v.cell(row=note_v_row, column=1,
+          value="⚠ Foglio OPZIONALE. Nell'intervallo [Data inizio, Data fine] l'operatore"
+                " può lavorare SOLO turni interamente contenuti in [Ora inizio, Ora fine].").font = NOTE_FONT
+ws_v.cell(row=note_v_row + 1, column=1,
+          value="Data fine vuota → singolo giorno. Ore vuote → nessun vincolo orario (solo nota)."
+                " Più righe stesso operatore → intersezione delle finestre nei giorni sovrapposti.").font = NOTE_FONT
+ws_v.cell(row=note_v_row + 2, column=1,
+          value="Eliminare righe di esempio se non servono. Se tutto il foglio è vuoto, nessun vincolo è applicato.").font = NOTE_FONT
+
 # ── Salva ─────────────────────────────────────────────────────────────────────
 out = "input_turni_template.xlsx"
 wb.save(out)

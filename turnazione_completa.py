@@ -41,6 +41,17 @@ class Operator:
     daily_hours: int
 
 
+@dataclass(frozen=True)
+class TimeConstraint:
+    """Vincolo temporale per-operatore: nel periodo [start_date, end_date]
+    può lavorare solo turni interamente contenuti in [window_start_min, window_end_min]."""
+    start_date: datetime
+    end_date: datetime
+    window_start_min: int
+    window_end_min: int
+    note: str = ""
+
+
 def parse_hhmm(value: str) -> time:
     return datetime.strptime(value, "%H:%M").time()
 
@@ -87,7 +98,13 @@ def parse_coverage_slot(slot_text: str) -> int | None:
 
 def load_input(
     path: Path,
-) -> Tuple[List[Operator], List[List[datetime]], List[Tuple[datetime, Dict[int, List[int]]]], Dict[str, Dict[datetime, str]]]:
+) -> Tuple[
+    List[Operator],
+    List[List[datetime]],
+    List[Tuple[datetime, Dict[int, List[int]]]],
+    Dict[str, Dict[datetime, str]],
+    Dict[str, List[TimeConstraint]],
+]:
     """Load and validate the input workbook.
 
     Returns:
@@ -96,6 +113,8 @@ def load_input(
         demand_schedule – list of (start_date, demand_matrix) sorted ascending;
                           each matrix covers all weeks from start_date until the next entry
         absences        – {operator_name: {date: tipo_label}} e.g. {"Mario": {datetime(...): "Ferie"}}
+        constraints     – {operator_name: [TimeConstraint,...]} vincoli temporali per-operatore
+                          (foglio `VincoliTemporali` opzionale; assente → {})
     """
     if not path.exists():
         raise FileNotFoundError(f"File input non trovato: {path}")
@@ -224,7 +243,98 @@ def load_input(
 
         absences.setdefault(name, {})[absence_date] = tipo
 
-    return operators, weeks, demand_schedule, absences
+    # --- VincoliTemporali (foglio opzionale) ---
+    # Struttura: {operator_name: [TimeConstraint, ...]}
+    # Colonne attese: Nome | Data inizio | Data fine | Ora inizio | Ora fine | Note
+    constraints: Dict[str, List[TimeConstraint]] = {}
+    if "VincoliTemporali" in wb.sheetnames:
+        ws_vin = wb["VincoliTemporali"]
+        for row_idx, row in enumerate(ws_vin.iter_rows(min_row=2, values_only=True), start=2):
+            if not row or not row[0] or not row[1]:
+                continue
+            name = str(row[0]).strip()
+            raw_start = row[1]
+            raw_end = row[2] if len(row) > 2 and row[2] else raw_start
+            raw_t_start = row[3] if len(row) > 3 else None
+            raw_t_end = row[4] if len(row) > 4 else None
+            note = str(row[5]).strip() if len(row) > 5 and row[5] else ""
+
+            start_dt = _coerce_date(raw_start, row_idx, name)
+            end_dt = _coerce_date(raw_end, row_idx, name)
+            if start_dt is None or end_dt is None:
+                continue
+            if end_dt < start_dt:
+                print(
+                    f"[AVVISO] VincoliTemporali riga {row_idx}: Data fine < Data inizio"
+                    f" per '{name}' — vincolo ignorato."
+                )
+                continue
+
+            w_start = _coerce_minutes(raw_t_start, default=0, row_idx=row_idx, name=name, field="Ora inizio")
+            w_end = _coerce_minutes(raw_t_end, default=24 * 60 - 1, row_idx=row_idx, name=name, field="Ora fine")
+            if w_start is None or w_end is None:
+                continue
+            if w_end <= w_start:
+                print(
+                    f"[AVVISO] VincoliTemporali riga {row_idx}: Ora fine <= Ora inizio"
+                    f" per '{name}' — vincolo ignorato."
+                )
+                continue
+
+            if name not in known_op_names:
+                print(
+                    f"[AVVISO] VincoliTemporali riga {row_idx}: operatore '{name}' non"
+                    f" trovato in Personale — vincolo ignorato."
+                )
+                continue
+
+            constraints.setdefault(name, []).append(
+                TimeConstraint(start_dt, end_dt, w_start, w_end, note)
+            )
+
+    return operators, weeks, demand_schedule, absences, constraints
+
+
+def _coerce_date(raw, row_idx: int, name: str) -> datetime | None:
+    """Normalize a cell value to datetime at midnight. Returns None on failure (with warning)."""
+    if isinstance(raw, datetime):
+        return raw.replace(hour=0, minute=0, second=0, microsecond=0)
+    if isinstance(raw, date):
+        return datetime(raw.year, raw.month, raw.day)
+    if isinstance(raw, str):
+        for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y"):
+            try:
+                return datetime.strptime(raw.strip(), fmt)
+            except ValueError:
+                continue
+    print(
+        f"[AVVISO] VincoliTemporali riga {row_idx}: data non riconosciuta per"
+        f" '{name}': {raw!r} — vincolo ignorato."
+    )
+    return None
+
+
+def _coerce_minutes(raw, default: int, row_idx: int, name: str, field: str) -> int | None:
+    """Normalize a time cell to minutes-since-midnight.
+    Empty/None → default. Returns None on parse failure (with warning)."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    if isinstance(raw, time):
+        return raw.hour * 60 + raw.minute
+    if isinstance(raw, datetime):
+        return raw.hour * 60 + raw.minute
+    if isinstance(raw, str):
+        for fmt in ("%H:%M", "%H.%M", "%H:%M:%S"):
+            try:
+                t = datetime.strptime(raw.strip(), fmt).time()
+                return t.hour * 60 + t.minute
+            except ValueError:
+                continue
+    print(
+        f"[AVVISO] VincoliTemporali riga {row_idx}: {field} non riconosciuto per"
+        f" '{name}': {raw!r} — vincolo ignorato."
+    )
+    return None
 
 
 def get_demand_for_week(
@@ -300,12 +410,45 @@ def pick_sunday_workers(
     return random.choice(best)
 
 
+def _forced_rest_by_constraints(
+    operators: List[Operator],
+    week_days: List[datetime],
+    constraints: Dict[str, List[TimeConstraint]],
+) -> Dict[str, Set[int]]:
+    """For each operator, compute the set of day indices where time constraints
+    leave zero valid shift options. Those days must become rest days."""
+    forced: Dict[str, Set[int]] = {op.name: set() for op in operators}
+    if not constraints:
+        return forced
+    for op in operators:
+        if op.name not in constraints:
+            continue
+        for day_idx in range(7):
+            options = generate_shift_options(op, day_idx)
+            if not options:
+                continue  # no valid shifts anyway (e.g. 8h on Sunday)
+            filtered = apply_time_constraints(
+                options, op.name, week_days[day_idx], constraints
+            )
+            if not filtered:
+                forced[op.name].add(day_idx)
+                day_label = DAY_LABELS[day_idx]
+                date_str = week_days[day_idx].strftime("%d/%m/%Y")
+                print(
+                    f"[INFO] '{op.name}' rest forzato {day_label} {date_str}:"
+                    f" vincolo temporale incompatibile con gli orari disponibili."
+                )
+    return forced
+
+
 def generate_rest_days(
     operators: List[Operator],
     demand_by_hour: Dict[int, List[int]],
     absences: Dict[str, Dict[int, str]],
     sunday_workers: Set[str],
     work_history: Dict[str, Dict[int, int]],
+    week_days: List[datetime],
+    constraints: Dict[str, List[TimeConstraint]],
 ) -> Dict[str, Set[int]]:
     """Assign 2 rest days per operator for the week.
 
@@ -321,16 +464,26 @@ def generate_rest_days(
     rest_days: Dict[str, Set[int]] = {}
     weekday_demand = [sum(demand_by_hour[h][d] for h in range(7, 20)) for d in range(6)]
 
+    # Vincoli temporali: giorni in cui le finestre orarie svuotano le opzioni → rest forzato
+    constraint_rest = _forced_rest_by_constraints(operators, week_days, constraints)
+
     zetema_ops = [op for op in operators if op.group == "Zetema"]
     non_zetema_ops = [op for op in operators if op.group == "Non Zetema"]
 
     # --- Zetema rest days ---
     weekday_options: Dict[str, List[Tuple[int, ...]]] = {}
     for op in zetema_ops:
+        # Giorni forzati a riposo: assenze lun-sab + vincoli temporali lun-sab
         forced = set(d for d in absences.get(op.name, {}) if d < 6)
+        forced |= {d for d in constraint_rest.get(op.name, set()) if d < 6}
+        sunday_forced = (6 in absences.get(op.name, {})) or (
+            6 in constraint_rest.get(op.name, set())
+        )
         if op.name in sunday_workers:
-            if 6 in absences.get(op.name, {}):
-                raise ValueError(f"'{op.name}' e' assegnato domenica ma risulta assente.")
+            if sunday_forced:
+                raise ValueError(
+                    f"'{op.name}' e' assegnato domenica ma risulta assente o vincolato."
+                )
             required_weekday_rip = 2
         else:
             required_weekday_rip = 1
@@ -412,6 +565,7 @@ def generate_rest_days(
     nonz_rest_count = [0] * 6
     for op in non_zetema_ops:
         forced = set(absences.get(op.name, {}))  # keys are day indices
+        forced |= constraint_rest.get(op.name, set())
         forced.add(6)  # Sunday is always rest
 
         # Se assenze > 2, l'operatore lavora meno di 5 giorni (gestito senza crash)
@@ -468,11 +622,41 @@ def generate_shift_options(op: Operator, day_idx: int) -> List[str]:
     return options
 
 
+def apply_time_constraints(
+    options: List[str],
+    op_name: str,
+    day_date: datetime,
+    constraints: Dict[str, List[TimeConstraint]],
+) -> List[str]:
+    """Filter shift options by the operator's active time constraints for `day_date`.
+
+    A shift is kept only if its [start_min, end_min] interval lies entirely within
+    every active constraint window (intersection semantics when multiple active).
+    """
+    if not constraints:
+        return options
+    day_midnight = day_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    active = [
+        c for c in constraints.get(op_name, [])
+        if c.start_date <= day_midnight <= c.end_date
+    ]
+    if not active:
+        return options
+    filtered: List[str] = []
+    for sh in options:
+        start_m, end_m, _ = parse_shift(sh)
+        if all(c.window_start_min <= start_m and end_m <= c.window_end_min for c in active):
+            filtered.append(sh)
+    return filtered
+
+
 def build_schedule(
     operators: List[Operator],
     demand_by_hour: Dict[int, List[int]],
     rest_days: Dict[str, Set[int]],
     sunday_workers: Set[str],
+    week_days: List[datetime],
+    constraints: Dict[str, List[TimeConstraint]],
     prev_preferred: Dict[str, str] | None = None,
 ) -> Dict[str, List[str]]:
     """Assign concrete shifts to every working day for every operator.
@@ -496,7 +680,13 @@ def build_schedule(
 
         zetema_workers = [op for op in workers if op.group == "Zetema"]
         if zetema_workers:
-            option_buckets = [generate_shift_options(op, day_idx) for op in zetema_workers]
+            option_buckets = [
+                apply_time_constraints(
+                    generate_shift_options(op, day_idx),
+                    op.name, week_days[day_idx], constraints,
+                )
+                for op in zetema_workers
+            ]
             best_combo: Tuple[str, ...] | None = None
             best_combo_score = -10**9
 
@@ -551,7 +741,10 @@ def build_schedule(
         workers = [op for op in workers if op.group != "Zetema"]
 
         for op in workers:
-            options = generate_shift_options(op, day_idx)
+            options = apply_time_constraints(
+                generate_shift_options(op, day_idx),
+                op.name, week_days[day_idx], constraints,
+            )
             if not options:
                 raise ValueError(
                     f"Nessuna opzione di turno per '{op.name}' nel giorno {DAY_LABELS[day_idx]}."
@@ -612,7 +805,10 @@ def build_schedule(
                 fixed = False
                 for op in all_day_workers:
                     old_shift = schedule[op.name][day_idx]
-                    for option in generate_shift_options(op, day_idx):
+                    for option in apply_time_constraints(
+                        generate_shift_options(op, day_idx),
+                        op.name, week_days[day_idx], constraints,
+                    ):
                         if missing_hour not in shift_to_hours(option):
                             continue
                         schedule[op.name][day_idx] = option
@@ -1031,7 +1227,7 @@ def write_output(
 
 
 def main() -> None:
-    operators, weeks, demand_schedule, absences = load_input(INPUT_FILE)
+    operators, weeks, demand_schedule, absences, constraints = load_input(INPUT_FILE)
     zetema_ops = [op for op in operators if op.group == "Zetema"]
 
     # Rotation trackers across weeks
@@ -1057,10 +1253,12 @@ def main() -> None:
             attempts_done = attempt + 1
             sunday_workers = pick_sunday_workers(zetema_ops, week_absences, sunday_history)
             rest_days = generate_rest_days(
-                operators, demand_by_hour, week_absences, sunday_workers, work_history
+                operators, demand_by_hour, week_absences, sunday_workers,
+                work_history, week_days, constraints,
             )
             schedule = build_schedule(
-                operators, demand_by_hour, rest_days, sunday_workers, prev_preferred
+                operators, demand_by_hour, rest_days, sunday_workers,
+                week_days, constraints, prev_preferred,
             )
 
             _, _, _, total_deficit = compute_coverage_stats(
